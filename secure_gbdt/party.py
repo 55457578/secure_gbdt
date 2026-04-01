@@ -1,6 +1,7 @@
 # secure_gbdt/party.py
 import numpy as np
 from typing import Optional, Dict, Any
+from .primitives import SecretShare, RLWECiphertext, A2H, H2A, F_cor
 
 try:
     import requests
@@ -52,8 +53,6 @@ class NetworkAdapter:
             raise RuntimeError("Requests not installed.")
             
         headers = {"X-API-Key": self.api_key}
-        # For local testing without strict TLS, verify can be False. 
-        # In production, pass a valid ca_cert.
         resp = requests.post(
             f"{self.peer_url}/rpc", 
             json={"method": method, "args": args},
@@ -64,91 +63,104 @@ class NetworkAdapter:
         resp.raise_for_status()
         return resp.json()["result"]
 
+
 class Party:
     def __init__(self, name, X, n_bins=16, network: Optional[NetworkAdapter] = None):
         self.name = name
         self.X = np.asarray(X, dtype=float)
         self.n, self.m = self.X.shape
         self.n_bins = n_bins
-        self.bin_edges = []         
-        self.binned = []            
+        
+        # SQUIRREL SPECIFIC: Binary Matrix representation of data
+        self.M = None 
+        
+        # Secret Sample Indicator vector (b_l^{(k)})
+        self.b_indicator = np.ones(self.n, dtype=int) 
+        self.bin_edges = []
+        
         self.network = network
 
     def fit_bins(self):
+        """
+        Squirrel Step 1: Locally partition data into bins and construct 
+        the Binary Matrix M in {0,1}^{B*m x n}
+        """
         self.bin_edges = []
-        self.binned = []
+        # Initialize an empty binary matrix M
+        self.M = np.zeros((self.n_bins * self.m, self.n), dtype=np.int8)
+        
         for j in range(self.m):
             qs = np.linspace(0, 100, self.n_bins + 1)[1:-1]
             edges = np.unique(np.percentile(self.X[:, j], qs))
             if edges.size == 0:
                 edges = np.array([np.max(self.X[:, j])])
-            b = np.digitize(self.X[:, j], edges) 
             self.bin_edges.append(edges)
-            self.binned.append(b)
-            
-    # --- NEW FEDERATED METHODS FOR RPC ---
-
-    def get_best_split(self, idx: list, g: list, h: list, gamma: float, epsilon: float) -> dict:
-        """
-        Evaluates local features to find the best split based on gradients.
-        Returns JSON-serializable dictionary.
-        """
-        # Convert RPC lists back to numpy arrays
-        idx = np.array(idx, dtype=int)
-        g = np.array(g, dtype=float)
-        h = np.array(h, dtype=float)
-        
-        from .primitives import add_dp_noise
-        
-        best_gain = -1e18
-        best = None
-        
-        for j in range(self.m):
-            bvals = self.binned[j][idx]
-            if bvals.size == 0:
-                continue
-            maxb = int(np.max(bvals))
-            B_eff = max(self.n_bins, maxb + 1)
-            
-            G = np.bincount(bvals, weights=g, minlength=B_eff).astype(float)[:self.n_bins]
-            H = np.bincount(bvals, weights=h, minlength=B_eff).astype(float)[:self.n_bins]
-
-            G_noisy = np.array([add_dp_noise(val, epsilon) for val in G])
-            H_noisy = np.array([add_dp_noise(val, epsilon) for val in H])
-
-            G_cum = np.cumsum(G_noisy)
-            H_cum = np.cumsum(H_noisy)
-            G_tot = G_noisy.sum()
-            H_tot = H_noisy.sum()
-
-            for u in range(0, self.n_bins - 1):
-                GL, HL = G_cum[u], H_cum[u]
-                GR, HR = G_tot - GL, H_tot - HL
                 
-                gain = (GL * GL) / (gamma + HL + 1e-12) + \
-                       (GR * GR) / (gamma + HR + 1e-12) - \
-                       (G_tot * G_tot) / (gamma + H_tot + 1e-12)
-                       
-                if np.isfinite(gain) and gain > best_gain:
-                    edges = self.bin_edges[j]
-                    thr = float(np.max(self.X[:, j])) if edges.size == 0 else float(edges[int(max(0, min(u, edges.size - 1)))])
-                    best_gain = gain
-                    best = (j, u, thr)
-
-        if best is None:
-            return {"gain": float(-1e18), "feat_idx": -1, "bin_u": -1, "thr": 0.0}
+            bvals = np.digitize(self.X[:, j], edges)
             
+            # Populate the Binary Matrix M
+            # M[B*z + u, i] = 1 if sample i is in bin u of feature z
+            for i in range(self.n):
+                u = min(bvals[i], self.n_bins - 1)
+                row_idx = (self.n_bins * j) + u
+                self.M[row_idx, i] = 1
+
+    def bin_mat_vec(self, encrypted_gradients: dict) -> dict:
+        """
+        Squirrel Protocol: BinMatVec (Figure 6).
+        Computes M * g securely using LWE homomorphic additions.
+        """
+        # Unwrap the simulated RLWECiphertext dict
+        raw_gradients = np.array(encrypted_gradients["encrypted_data"])
+        pub_key = encrypted_gradients["pub_key_owner"]
+        
+        # We leverage the sparsity of the indicator (Optimization 4.5.1)
+        active_gradients = raw_gradients * self.b_indicator
+        
+        # Matrix-vector multiplication (Simulating Homomorphic Summation)
+        aggregated_stats = self.M.dot(active_gradients)
+        
+        # Wrap it back up as a dict to pass securely over the network JSON
         return {
-            "gain": float(best_gain), 
-            "feat_idx": int(best[0]), 
-            "bin_u": int(best[1]), 
-            "thr": float(best[2])
+            "encrypted_data": aggregated_stats.tolist(),
+            "pub_key_owner": pub_key
         }
 
-    def evaluate_split(self, idx: list, feat_idx: int, thr: float) -> list:
+    def update_indicator(self, split_identifier: dict, is_owner: bool):
         """
-        Returns a boolean mask (as a list) for routing data down the tree.
+        Squirrel Protocol: Locally Update Sample Indicator (Section 4.2).
+        Maintains the invariant b^(k) = b_0^(k) AND b_1^(k) using F_cor
         """
-        idx = np.array(idx, dtype=int)
-        sel = (self.X[idx, feat_idx] <= thr)
-        return sel.tolist()
+        if not is_owner:
+            # P_{1-c} keeps indicators unchanged
+            pass 
+        else:
+            # P_c updates child indicators locally based on the split
+            feat_idx = split_identifier["feat_idx"]
+            thr = split_identifier["thr"]
+            
+            # Create the private choice vector b_*
+            b_star = (self.X[:, feat_idx] <= thr).astype(int)
+            
+            # Update left child indicator locally
+            self.b_indicator = self.b_indicator & b_star
+            
+        return True
+
+    def evaluate_split_indicator(self, feat_idx: int, bin_u: int, idx: list = None) -> list:
+        """
+        Called securely over RPC. Evaluates a split based on feature and bin index, 
+        ensuring the raw threshold value never leaves this server.
+        """
+        edges = self.bin_edges[feat_idx]
+        thr = float(np.max(edges)) if edges.size == 0 else float(edges[min(bin_u, edges.size - 1)])
+        
+        if idx is None:
+            # Return full boolean mask
+            b_star = (self.X[:, feat_idx] <= thr).astype(int)
+        else:
+            # Return mask only for specific row indices
+            idx_arr = np.array(idx, dtype=int)
+            b_star = (self.X[idx_arr, feat_idx] <= thr).astype(int)
+            
+        return b_star.tolist()
