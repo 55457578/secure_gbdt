@@ -67,7 +67,6 @@ col3, col4 = st.columns(2)
 
 with col3:
     if st.button("Start RPC Server", disabled=st.session_state.alice_party is None or st.session_state.server_running):
-        # Start server in a background daemon thread
         server_thread = threading.Thread(
             target=start_background_server, 
             args=(st.session_state.alice_party, host_ip, port, api_key, cert_path, key_path),
@@ -83,12 +82,51 @@ with col3:
 with col4:
     st.subheader("Hyperparameters")
     max_depth = st.slider("Max Depth", 1, 10, 4)
-    epsilon = st.slider("DP Epsilon (Privacy Budget)", 0.1, 10.0, 0.5)
     
     if st.button("Start Training Process", disabled=not st.session_state.server_running):
         with st.spinner("Coordinating with Bob and building trees..."):
-            # NOTE: Your VerticalGBDT class currently expects Bob's data locally.
-            # You will eventually replace this block with the network-coordinated training loop.
-            st.info("Initiating tree building protocol...")
-            time.sleep(2) # Mocking network delay
+            
+            # 1. Initialize the actual model using Alice's party and labels
+            v_gbdt = VerticalGBDT(
+                host_party=st.session_state.alice_party,
+                y=st.session_state.y_labels,
+                max_depth=max_depth,
+            )
+            
+            # 2. Run the federated training loop
+            v_gbdt.fit()
+            
+            # 3. Save the trained model to Streamlit's memory so we can use it below
+            st.session_state.trained_model = v_gbdt
             st.success("Training Complete! Forest generated.")
+
+st.divider()
+
+# --- NEW SECTION: SEE THE RESULTS ---
+st.header("4. Results & Predictions")
+
+# Only show this section IF the model has finished training
+if "trained_model" in st.session_state:
+    if st.button("Generate Predictions"):
+        with st.spinner("Asking Bob for his feature evaluations and computing results..."):
+            
+            # Run the predict function we wrote in vertical_gbdt.py
+            predictions = st.session_state.trained_model.predict()
+            
+            # Calculate how accurate the model is
+            actual_y = st.session_state.y_labels
+            accuracy = (predictions == actual_y).mean()
+            
+            # Display a big metric on the screen
+            st.metric(label="Model Accuracy", value=f"{accuracy * 100:.2f}%")
+            
+            # Put the results in a table so you can see exactly what the model guessed
+            results_df = pd.DataFrame({
+                "Actual Label (y)": actual_y,
+                "Model Prediction": predictions
+            })
+            
+            st.write("Here are the first 50 predictions compared to the actual data:")
+            st.dataframe(results_df.head(50))
+else:
+    st.info("Train the model first to see the predictions here.")
